@@ -22,20 +22,13 @@ on:
 jobs:
   build-frontend:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        node-version: [18]
     steps:
     - uses: actions/checkout@v4
-    - uses: pnpm/action-setup@v4
+    - name: 设置go环境
+      uses: actions/setup-go@v5
       with:
-        version: latest
-    - name: 使用 Node.js ${{ matrix.node-version }}
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ matrix.node-version }}
-        cache: 'pnpm'
-    - name: 安装依赖
+        go-version-file: "go.mod"
+        cache-dependency-path: "go.sum"
+    - name: 编译后端
       run: |
-        pnpm install
-        pnpm build
+        go mod tidy -v

@@ -1,0 +1,238 @@
+#!/bin/bash
+set -e
+if ./scripts/only-ui-bumps.sh; then
+    exit 0
+fi
+
+#########################################################################################################################################
+# DISCLAIMER                                                                                                                            #
+# Copied from https://github.com/moby/moby/blob/ed89041433a031cafc0a0f19cfe573c31688d377/hack/dind#L28-L37                              #
+# Permission granted by Akihiro Suda <akihiro.suda.cz@hco.ntt.co.jp> (https://github.com/rancher/k3d/issues/493#issuecomment-827405962) #
+# Moby License Apache 2.0: https://github.com/moby/moby/blob/ed89041433a031cafc0a0f19cfe573c31688d377/LICENSE                           #
+#########################################################################################################################################
+# only run this if rancher is not running in kubernetes cluster and if the init cgroup does not already exist
+# we have to run this early on in provisioning-tests otherwise, the moving of processes is likely to fail due to
+# non-existent PIDs from the retry script below to check for Rancher health
+if [ -f /sys/fs/cgroup/cgroup.controllers ] && [ ! -d /sys/fs/cgroup/init ]; then
+  # move the processes from the root group to the /init group,
+  # otherwise writing subtree_control fails with EBUSY.
+  mkdir -p /sys/fs/cgroup/init
+  xargs -rn1 < /sys/fs/cgroup/cgroup.procs > /sys/fs/cgroup/init/cgroup.procs || :
+  # enable controllers
+  sed -e 's/ / +/g' -e 's/^/+/' <"/sys/fs/cgroup/cgroup.controllers" >"/sys/fs/cgroup/cgroup.subtree_control"
+fi
+
+cleanup()
+{
+    EXIT=$?
+    set +ex
+    echo Stopping rancher server
+    kill $RANCHER_RUN_PID
+    wait $RANCHER_RUN_PID
+    if [ $PID != -1 ]; then
+      kill $PID
+      wait $PID
+    fi
+    return $EXIT
+}
+
+cd $(dirname $0)/..
+
+TB_ORG=rancher
+
+if [ -z "${V2PROV_TEST_DIST}" ] || [ "${V2PROV_TEST_DIST}" = "k3s" ]; then
+  V2PROV_TEST_DIST=k3s
+  AIRGAP=-airgap
+  TB_ORG=k3s-io
+else
+  LINUX=.linux
+fi
+
+if [ -z "${V2PROV_TEST_RUN_REGEX}" ]; then
+  V2PROV_TEST_RUN_REGEX="^Test_(General|Provisioning|Fleet)_.*$"
+fi
+
+RUNARG="-run ${V2PROV_TEST_RUN_REGEX}"
+
+export DIST=${V2PROV_TEST_DIST}
+export SOME_K8S_VERSION=${SOME_K8S_VERSION}
+export TB_ORG=${TB_ORG}
+export CATTLE_CHART_DEFAULT_URL=${CATTLE_CHART_DEFAULT_URL}
+export CATTLE_FEATURES=${CATTLE_FEATURES}
+
+# Tell Rancher to use the recently-built Rancher cluster agent image. This image is built as part of CI and will be
+# copied to the in-cluster registry during test setup below.
+source ./scripts/version
+
+# defaulting to :head (matching the hardcoded value within rancher) if CATTLE_AGENT_IMAGE or TAG is not specified
+if [ $TAG = "dev" ]; then 
+    TAG="head"
+fi
+
+export CATTLE_AGENT_IMAGE=${CATTLE_AGENT_IMAGE:-rancher/rancher-agent:${TAG:-head}}
+echo "Using Rancher agent image $CATTLE_AGENT_IMAGE"
+
+eval "$(grep '^ENV CATTLE_SYSTEM_AGENT' package/Dockerfile | awk '{print "export " $2 "=" $3}')"
+eval "$(grep '^ENV CATTLE_WINS_AGENT' package/Dockerfile | awk '{print "export " $2 "=" $3}')"
+eval "$(grep '^ENV CATTLE_CSI_PROXY_AGENT' package/Dockerfile | awk '{print "export " $2 "=" $3}')"
+eval "$(grep '^ENV CATTLE_KDM_BRANCH' package/Dockerfile | awk '{print "export " $2 "=" $3}')"
+
+export CATTLE_RANCHER_PROVISIONING_CAPI_VERSION=$(yq '.provisioningCAPIVersion' < build.yaml)
+
+if [ -z "${SOME_K8S_VERSION}" ]; then
+# Only set SOME_K8S_VERSION if it is empty -- for KDM provisioning tests, this value should already be populated
+# Get the last release for $DIST, which is usually the latest version or an experimental version.
+# Previously this would use channels, but channels no longer reflect the latest version since
+# https://github.com/rancher/rancher/issues/36827 has added appDefaults. We do not use appDefaults
+# here for simplicity's sake, as it requires semver parsing & matching. The last release should
+# be good enough for our needs.
+  export SOME_K8S_VERSION=$(curl -sS https://raw.githubusercontent.com/rancher/kontainer-driver-metadata/dev-v2.11/data/data.json | jq -r ".$DIST.releases[-1].version")
+fi
+
+if [ -z "${CATTLE_CHART_DEFAULT_URL}" ]; then
+# If `CATTLE_CHART_DEFAULT_URL` is not set, use the `https://github.com/rancher/charts` so GitHub is used instead of
+# the default `https://git.rancher.io/charts` to reduce the reliance and load on our Git mirror
+export CATTLE_CHART_DEFAULT_URL=https://github.com/rancher/charts
+fi
+
+echo "Starting rancher server for provisioning-tests using $SOME_K8S_VERSION"
+touch /tmp/rancher.log
+
+mkdir -p /var/lib/rancher/$DIST/agent/images
+grep PodTestImage ./tests/v2prov/defaults/defaults.go | cut -f2 -d'"' > /var/lib/rancher/$DIST/agent/images/pull.txt
+grep MachineProvisionImage ./pkg/settings/setting.go | cut -f4 -d'"' >> /var/lib/rancher/$DIST/agent/images/pull.txt
+mkdir -p /usr/share/rancher/ui/assets
+curl -sLf ${CATTLE_SYSTEM_AGENT_DOWNLOAD_PREFIX}/${CATTLE_SYSTEM_AGENT_VERSION}/rancher-system-agent-amd64 -o /usr/share/rancher/ui/assets/rancher-system-agent-amd64
+curl -sLf ${CATTLE_SYSTEM_AGENT_DOWNLOAD_PREFIX}/${CATTLE_SYSTEM_AGENT_VERSION}/rancher-system-agent-arm64 -o /usr/share/rancher/ui/assets/rancher-system-agent-arm64
+curl -sLf ${CATTLE_SYSTEM_AGENT_DOWNLOAD_PREFIX}/${CATTLE_SYSTEM_AGENT_VERSION}/system-agent-uninstall.sh -o /usr/share/rancher/ui/assets/system-agent-uninstall.sh
+
+build_and_run_rancher()
+{
+    RESTART_COUNT=0
+    while sleep 2; do
+        if [ "$PID" != "-1" ] && [ ! -e /proc/$PID ]; then
+            echo Rancher died
+            dump_rancher_logs
+            echo K3s logs were:
+            echo -e "-----K3S-LOG-DUMP-START-----"
+            cat build/testdata/k3s.log | gzip | base64 -w 0
+            echo -e "\n-----K3S-LOG-DUMP-END-----"
+            set +e
+            echo Attempting to kill K3s
+            pkill -e k3s
+            set -e
+            PID=-1
+            if [ "$RESTART_COUNT" = "2" ]; then
+                echo Rancher died 3 times, aborting
+                kill -42 $PWRAPPROC
+            fi
+            RESTART_COUNT=$((RESTART_COUNT + 1))
+            sleep 5
+        fi
+        if [ "$PID" = "-1" ]; then
+          echo Starting rancher server using run
+          ./scripts/run >/tmp/rancher.log 2>&1 &
+          PID=$!
+        fi
+        sleep 2
+    done
+}
+
+dump_rancher_logs()
+{
+  echo Rancher logs were
+  echo -e "-----RANCHER-LOG-DUMP-START-----"
+  cat /tmp/rancher.log | gzip | base64 -w 0
+  echo -e "\n-----RANCHER-LOG-DUMP-END-----"
+}
+export -f dump_rancher_logs
+
+push_cattle_agent_image()
+{
+  echo "pushing local cattle-agent image - waiting for registry-cache to be available"
+
+  ./scripts/retry \
+    --timeout 300 \
+    --sleep 2 \
+    --message "registry-cache was not available after {{elapsed}} seconds" \
+    --message-interval 30 \
+    --exit-command "echo registry-cache never came up. RIP" \
+    "kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get pod registry-cache -n default &>/dev/null"
+
+  echo "registry-cache pod found! waiting for pod to be running"
+  kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml wait --for=condition=ready pod/registry-cache -n default
+
+  # we're referring to the docker IP of the current pod...but since the docker socket is from the host localhost
+  # won't work. so we refer to it by the internal docker IP of the container to make it all work.
+  echo "setting up credentials"
+  docker login -u admin -p admin https://172.17.0.2:5000
+  echo "pushing ${CATTLE_AGENT_IMAGE}"
+  docker push 172.17.0.2:5000/$CATTLE_AGENT_IMAGE
+  echo "successfully pushed $CATTLE_AGENT_IMAGE to registry-cache"
+}
+
+# Get the rancher binary ready
+#
+# This needs to happen before build_and_run_rancher is executed in the background.
+# Otherwise, build_and_run_rancher will also compile Rancher, overly elongating the
+# time before Rancher is ready and therefore causing flakiness of the health check below.
+
+if ! docker image inspect rancher/rancher:$TAG >/dev/null 2>&1 ; then
+    echo "building rancher from source - no preloaded container image available"
+    ./scripts/build-server
+else
+    # otherwise just copy it from the artifacts that are already there. neat!
+    echo "pulling bin/rancher from preloaded container image"
+    container_id=$(docker create rancher/rancher:$TAG)
+    docker cp $container_id:/usr/bin/rancher bin/rancher
+    docker rm $container_id
+fi
+
+# uncomment to get startup logs. Don't leave them on because it slows drone down too
+# much
+#tail -F /tmp/rancher.log &
+#TPID=$!
+
+trap "exit 1" 42
+PWRAPPROC="$$"
+
+PID=-1
+build_and_run_rancher &
+RANCHER_RUN_PID=$!
+trap cleanup exit
+
+echo "Waiting for Rancher to be healthy"
+./scripts/retry --sleep 2 --timeout 300 "curl -sf -o /dev/null http://localhost:8080/ping"
+
+echo "Waiting up to 5 minutes for rancher-webhook deployment"
+./scripts/retry \
+  --timeout 300 `# Time out after 300 seconds (5 min)` \
+  --sleep 2 `# Sleep for 2 seconds in between attempts` \
+  --message-interval 30 `# Print the progress message below every 30 attempts (roughly every minute)` \
+  --message "rancher-webhook was not available after {{elapsed}} seconds" `# Print this progress message` \
+  --exit-command "dump_rancher_logs" `# Dump logs to find out why webhook did not start` \
+  "kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml rollout status -n cattle-system deploy/rancher-webhook &>/dev/null"
+
+echo "Waiting up to 5 minutes for rancher-provisioning-capi deployment"
+./scripts/retry \
+  --timeout 300 `# Time out after 300 seconds (5 min)` \
+  --sleep 2 `# Sleep for 2 seconds in between attempts` \
+  --message-interval 30 `# Print the progress message below every 30 attempts (roughly every minute)` \
+  --message "rancher-provisioning-capi was not available after {{elapsed}} seconds" `# Print this progress message` \
+  --exit-command "dump_rancher_logs" `# Dump logs to find out why webhook did not start` \
+  "kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml rollout status -n cattle-provisioning-capi-system deploy/capi-controller-manager &>/dev/null"
+
+# only push the image if we're not using the default image:tag
+if [ "${CATTLE_AGENT_IMAGE}" != "rancher/rancher-agent:head" ]; then
+  ( push_cattle_agent_image & )
+fi
+
+#kill $TPID
+
+echo Running provisioning-tests $RUNARG
+
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+go test $RUNARG -v -failfast -timeout 60m ./tests/v2prov/tests/... || {
+     dump_rancher_logs
+     exit 1
+}

@@ -1,0 +1,62 @@
+suite: Test Service
+templates:
+- service.yaml
+tests:
+- it: should set NodePort service type
+  set:
+    service.type: NodePort
+  asserts:
+  - equal:
+      path: spec.type
+      value: NodePort
+- it: should set LoadBalancer service type
+  set:
+    service.type: LoadBalancer
+  asserts:
+  - equal:
+      path: spec.type
+      value: LoadBalancer
+- it: should default to ClusterIP service type
+  asserts:
+  - isNull:
+      path: spec.type
+- it: should set provided service annotation correctly
+  set:
+    service.annotations:
+      beta.cloud.google.com/backend-config: '{"default": "rancher-config"}'
+  asserts:
+  - equal:
+      path: metadata.annotations
+      value:
+        beta.cloud.google.com/backend-config: '{"default": "rancher-config"}'
+- it: should set multiple provided service annotations correctly
+  set:
+    service.annotations:
+      beta.cloud.google.com/backend-config: '{"default": "rancher-config"}'
+      cloud.google.com/neg: '{"ingress": true}'
+  asserts:
+  - equal:
+      path: metadata.annotations
+      value:
+        beta.cloud.google.com/backend-config: '{"default": "rancher-config"}'
+        cloud.google.com/neg: '{"ingress": true}'
+- it: should not include service annotations if none are provided
+  asserts:
+  - isNull:
+      path: metadata.annotations
+- it: should define both http and https-internal ports
+  asserts:
+    - equal:
+        path: spec.ports[0].name
+        value: http
+    - equal:
+        path: spec.ports[1].name
+        value: https-internal
+- it: should define disable HTTP port when disableHTTP is true
+  set:
+    service.disableHTTP: true
+    ingress.servicePort: 443
+  asserts:
+    - equal:
+        path: spec.ports[0].name
+        value: https-internal
