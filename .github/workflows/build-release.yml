@@ -31,4 +31,4 @@ jobs:
         cache-dependency-path: "go.sum"
     - name: 编译后端
       run: |
-        go mod tidy -v
+         export GOPROXY='';go mod tidy -v
